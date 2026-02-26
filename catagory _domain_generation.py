@@ -6,55 +6,60 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 from openai import OpenAI
 
+
 load_dotenv()
 
 client = OpenAI(
-    base_url=os.getenv("LLM_API_BASE", "http://10.52.88.105:1234/v1"),
-    
+base_url="http://10.52.88.105:1234/v1",
+api_key="sk-xxx"
 )
-MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-oss-20b")
+MODEL_NAME =  "gpt-oss-20b"
+
 
 INPUT_FILE = "combined_cleaned_dataset.jsonl" 
 OUTPUT_FILE = "dataset_final_enriched.jsonl"
-AUTOSAVE_INTERVAL = 50 
-
+AUTOSAVE_INTERVAL = 50
 
 SUGGESTED_CATEGORIES = [
-    "poultry_health_production", "immunology_host", "metabolism_functional", 
-    "microbiome_analysis", "sequencing_bioinfo", "genomics_infra", 
-    "alignment", "assembly", "binning", "annotation", "taxonomy", 
-    "diversity_analysis", "quantification", "pipeline_design"
+    # Catégories réellement présentes dans le dataset
+    "alignment", "annotation", "assembly", "assembly_qc", "bin_qc",
+    "binning", "diversity_analysis", "functional_profiling", "genomics_infra",
+    "host_decontamination", "machine_learning", "multiomics", "pipeline_design",
+    "qc_preprocessing", "quantification", "sequencing", "statistical_analysis",
+    "taxonomy", "visualization"
 ]
 
-SUGGESTED_TOPICS = [
-    "QC & Preprocessing", "Assembly", "Binning", "Annotation", "Taxonomy / Classification", 
-    "Metagenomics Tools", "Errors & Debugging", "Performance & Scaling", "Gut Microbiota", 
-    "Metabolites / SCFA", "Fermentation", "Diet / Nutrition", "Poultry Biology", 
-    "Immunology", "Receptor Signaling", "Gut Barrier / Mucosal", "Energy / Metabolism", "Epigenetics"
+SUGGESTED_DOMAINS = [
+    # Domaines réellement présents dans le dataset
+    "QC & Preprocessing", "Assembly", "Binning", "Annotation",
+    "Taxonomy / Classification", "Metagenomics Tools", "Errors & Debugging",
+    "Performance & Scaling", "Gut Microbiota", "Metabolites / SCFA",
+    "Fermentation", "Diet / Nutrition", "Poultry Biology",
+    # Domaines manquants ajoutés
+    "Energy / Metabolism", "Epigenetics", "Gut Barrier / Mucosal",
+    "Immunology", "Receptor Signaling"
 ]
 
 def get_system_prompt():
     return f"""You are an expert bioinformatician and biologist data annotator.
-Your task is to classify a given scientific text into EXACTLY ONE Category and EXACTLY ONE primary Topic.
+Your task is to classify a given scientific text into EXACTLY ONE Category and EXACTLY ONE primary Domain.
 
 Here are some SUGGESTED Categories: {SUGGESTED_CATEGORIES}
-Here are some SUGGESTED Topics: {SUGGESTED_TOPICS}
+Here are some SUGGESTED Domains: {SUGGESTED_DOMAINS}
 
 RULES:
-1. You may choose from the suggested lists, OR you can INVENT a new short, descriptive Category or Topic if the text does not fit any of the suggestions well.
-2. Keep your invented Categories and Topics concise (1 to 3 words max, e.g., "viral_genomics" or "Host-Pathogen Interaction").
-3. Output your response STRICTLY as a raw JSON object. No markdown, no explanations.
+1. You may choose from the suggested lists, OR INVENT a new short, descriptive Category/Domain if needed.
+2. Output your response STRICTLY as a raw JSON object.
 
 EXPECTED JSON FORMAT:
 {{
-    "category": "your_chosen_or_invented_category",
-    "topic": "your_chosen_or_invented_topic"
+    "category": "your_category",
+    "domain": "Your Domain"
 }}"""
 
 
 def classify_with_llm(text):
     try:
-       
         truncated_text = text[:5000] if isinstance(text, str) else str(text)
         
         response = client.chat.completions.create(
@@ -67,83 +72,123 @@ def classify_with_llm(text):
         )
         
         raw_output = response.choices[0].message.content.strip()
-        
-        
         match = re.search(r'\{.*\}', raw_output, re.DOTALL)
         if match:
             parsed_data = json.loads(match.group(0))
             
-            
             cat = parsed_data.get('category', 'other')
-            topic = parsed_data.get('topic', 'Other / Unclassified')
+            domain = parsed_data.get('domain', 'Other / Unclassified')
             
-            
-            if isinstance(cat, str):
-                cat = cat.lower().replace(" ", "_")
-            if isinstance(topic, str):
-                topic = topic.title()
+            if isinstance(cat, str): cat = cat.lower().replace(" ", "_")
+            if isinstance(domain, str): domain = domain.title()
                 
-            return cat, topic
+            return cat, domain
             
     except Exception as e:
-       
         pass
-        
     return None, None
 
+
+def extract_text_from_row(row):
+    parts = []
+    for key in ['instruction', 'output', 'question', 'answer', 'steps', 'constraints']:
+        if pd.notna(row.get(key)):
+            val = row[key]
+            if isinstance(val, list):
+                parts.append(" ".join(map(str, val)))
+            else:
+                parts.append(str(val))
+    return " ".join(parts)
+
+
+def is_invalid_category(cat):
+    return cat in ('other', 'Other', None, '') or not cat
+
+
+def is_invalid_domain(domains):
+    if not isinstance(domains, list):
+        return True
+    if len(domains) == 0:
+        return True
+    if 'Other / Unclassified' in domains:
+        return True
+    return False
+
+
 def main():
-    
+
     if not os.path.exists(INPUT_FILE):
-        print(f"ichier {INPUT_FILE} introuvable.")
+        print("File introuvable.")
         return
 
-    
-    records = []
+    # 1. Lire toutes les lignes en JSON brut (préserve le format hétérogène)
+    rows = []
     with open(INPUT_FILE, 'r', encoding='utf-8') as f:
         for line in f:
-            if line.strip():
-                records.append(json.loads(line))
-                
-    df = pd.DataFrame(records)
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
 
- 
-    if 'topic_main' not in df.columns:
-        df['topic_main'] = 'Other / Unclassified'
-        
+    # 2. Identifier les lignes à traiter
+    target_indices = []
+    for i, row in enumerate(rows):
+        cat = row.get('category', '')
+        domains = row.get('domains', [])
+        if is_invalid_category(cat) or is_invalid_domain(domains):
+            target_indices.append(i)
 
-    mask_cat = df['category'].isin(['other', 'Other', None, '']) | df['category'].isna()
-    mask_topic = df['topic_main'].isin(['Other / Unclassified', None, '']) | df['topic_main'].isna()
-    
-    target_indices = df[mask_cat | mask_topic].index.tolist()
-    print(f"{len(target_indices)} has value missing .")
+    print(f"{len(target_indices)} / {len(rows)} lignes à traiter.")
 
-  
+    # 3. Traiter et sauvegarder en préservant le format original
     processed_count = 0
     try:
         for idx in tqdm(target_indices):
-            text = str(df.loc[idx, 'full_text'])
-            new_cat, new_topic = classify_with_llm(text)
-            
-            if new_cat is not None and new_topic is not None:
-               
-                if df.loc[idx, 'category'] in ['other', 'Other', None, ''] or pd.isna(df.loc[idx, 'category']):
-                    df.loc[idx, 'category'] = new_cat
-                    
-                if df.loc[idx, 'topic_main'] in ['Other / Unclassified', None, ''] or pd.isna(df.loc[idx, 'topic_main']):
-                    df.loc[idx, 'topic_main'] = new_topic
-                
+            row = rows[idx]
+
+            # Extraire le texte
+            parts = []
+            for key in ['instruction', 'output', 'question', 'answer', 'steps', 'constraints']:
+                val = row.get(key)
+                if val is not None and str(val).strip():
+                    if isinstance(val, list):
+                        parts.append(" ".join(map(str, val)))
+                    else:
+                        parts.append(str(val))
+            text = " ".join(parts).strip()
+
+            if not text:
+                continue
+
+            new_cat, new_domain = classify_with_llm(text)
+
+            if new_cat is not None and new_domain is not None:
+                # Bloc 1 : Corriger la catégorie si invalide
+                if is_invalid_category(row.get('category', '')):
+                    row['category'] = new_cat
+
+                # Bloc 2 : Corriger le domaine INDÉPENDAMMENT
+                if is_invalid_domain(row.get('domains', [])):
+                    row['domains'] = [new_domain]
+
             processed_count += 1
-            
-            
+
+            # Autosave toutes les N lignes (format original préservé)
             if processed_count % AUTOSAVE_INTERVAL == 0:
-                df.to_json(OUTPUT_FILE, orient='records', lines=True, force_ascii=False)
-                
+                save_jsonl(rows, OUTPUT_FILE)
+
     except KeyboardInterrupt:
-        print("\n Processus interrompu par l'utilisateur.")
+        print("\nInterrompu.")
     finally:
-        print(f"\n Sauvegarde finale du dataset ")
-        df.to_json(OUTPUT_FILE, orient='records', lines=True, force_ascii=False)
-        print(f" fin : {OUTPUT_FILE}")
+        save_jsonl(rows, OUTPUT_FILE)
+        print(f"Fichier généré : {OUTPUT_FILE}")
+
+
+def save_jsonl(rows, filepath):
+    """Sauvegarde ligne par ligne — chaque objet garde SES propres champs uniquement."""
+    with open(filepath, 'w', encoding='utf-8') as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + '\n')
+
 
 if __name__ == "__main__":
     main()
