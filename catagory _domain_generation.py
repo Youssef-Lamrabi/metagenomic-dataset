@@ -83,9 +83,11 @@ def classify_with_llm(text):
             if isinstance(domain, str): domain = domain.title()
                 
             return cat, domain
+        else:
+            print(f"  [WARN] Pas de JSON trouvé dans la réponse: {raw_output[:200]}")
             
     except Exception as e:
-        pass
+        print(f"  [ERROR] LLM: {type(e).__name__}: {e}")
     return None, None
 
 
@@ -162,13 +164,23 @@ def main():
             new_cat, new_domain = classify_with_llm(text)
 
             if new_cat is not None and new_domain is not None:
+                updated = False
                 # Bloc 1 : Corriger la catégorie si invalide
                 if is_invalid_category(row.get('category', '')):
                     row['category'] = new_cat
+                    updated = True
 
                 # Bloc 2 : Corriger le domaine INDÉPENDAMMENT
                 if is_invalid_domain(row.get('domains', [])):
                     row['domains'] = [new_domain]
+                    updated = True
+
+                if updated:
+                    print(f"  [OK] idx={idx} → cat={new_cat}, domain={new_domain}")
+                else:
+                    print(f"  [SKIP] idx={idx} — déjà valide")
+            else:
+                print(f"  [FAIL] idx={idx} — LLM n'a rien retourné")
 
             processed_count += 1
 
