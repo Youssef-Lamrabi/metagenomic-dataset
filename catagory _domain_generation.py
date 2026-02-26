@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import sys
 import pandas as pd
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -83,9 +84,11 @@ def classify_with_llm(text):
             if isinstance(domain, str): domain = domain.title()
                 
             return cat, domain
+        else:
+            print(f"  [NO-JSON] Réponse LLM brute: {raw_output[:300]}", flush=True)
             
     except Exception as e:
-        print("Erreur LLM :", e)
+        print(f"  [ERROR] {type(e).__name__}: {e}", flush=True)
     return None, None
     
 
@@ -162,13 +165,13 @@ def main():
             new_cat, new_domain = classify_with_llm(text)
 
             if new_cat is not None and new_domain is not None:
-                
                 if is_invalid_category(row.get('category', '')):
                     row['category'] = new_cat
-
-               
                 if is_invalid_domain(row.get('domains', [])):
                     row['domains'] = [new_domain]
+                print(f"  [OK] idx={idx} → cat={new_cat}, domain={new_domain}", flush=True)
+            else:
+                print(f"  [FAIL] idx={idx} — LLM n'a rien retourné", flush=True)
 
             processed_count += 1
 
