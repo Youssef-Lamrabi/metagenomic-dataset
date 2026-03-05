@@ -1,197 +1,155 @@
 import os
 import json
 import re
-import sys
-import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from dotenv import load_dotenv
 from openai import OpenAI
 
-
 load_dotenv()
 
-client = OpenAI(
-    base_url="http://localhost:11434/v1", 
-    api_key="ollama"  
-)
-MODEL_NAME =  "gpt-oss:20b"
+client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+MODEL_NAME = "gpt-oss:20b"
 
-
-INPUT_FILE = "combined_cleaned_dataset.jsonl" 
-OUTPUT_FILE = "dataset_final_enriched.jsonl"
-AUTOSAVE_INTERVAL = 50
+INPUT_FILE  = "paper_other.jsonl"
+OUTPUT_FILE = "paper_other_classified.jsonl"
+MAX_WORKERS = 3
+AUTOSAVE_INTERVAL = 100
 
 SUGGESTED_CATEGORIES = [
-    
-    "alignment", "annotation", "assembly", "assembly_qc", "bin_qc",
-    "binning", "diversity_analysis", "functional_profiling", "genomics_infra",
-    "host_decontamination", "machine_learning", "multiomics", "pipeline_design",
-    "qc_preprocessing", "quantification", "sequencing", "statistical_analysis",
-    "taxonomy", "visualization"
-]
-
-SUGGESTED_DOMAINS = [
-   
-    "QC & Preprocessing", "Assembly", "Binning", "Annotation",
-    "Taxonomy / Classification", "Metagenomics Tools", "Errors & Debugging",
-    "Performance & Scaling", "Gut Microbiota", "Metabolites / SCFA",
-    "Fermentation", "Diet / Nutrition", "Poultry Biology",
-  
-    "Energy / Metabolism", "Epigenetics", "Gut Barrier / Mucosal",
-    "Immunology", "Receptor Signaling"
+    "pipeline_design", "qc_preprocessing", "sequencing", "host_decontamination",
+    "alignment", "assembly", "assembly_qc", "binning", "bin_qc", "taxonomy",
+    "annotation", "functional_profiling", "quantification", "diversity_analysis",
+    "statistical_analysis", "visualization", "machine_learning", "multiomics",
+    "genomics_infra", "experimental_design", "sample_collection", "phylogenetics",
+    "dna_extraction", "troubleshooting", "preprocessing", "general_question",
+    "literature_review", "validation", "benchmark", "amplicon_sequencing",
+    "genome_editing", "epigenetic_analysis", "metabolomics", "metabolite_analysis",
+    "metabolic_pathway", "biogeochemistry", "biochemistry", "enzyme_activity",
+    "microbial_physiology", "microbial_interaction", "microbial_isolation",
+    "biodegradation", "bioremediation", "cell_biology", "cell_culture",
+    "strain_isolation", "antibiotic_resistance_analysis", "antimicrobial_mechanism",
+    "mechanisms_of_resistance", "detection", "environmental_analysis",
+    "environmental_microbiology", "ecology", "sampling_design", "soil_analysis",
+    "geochemistry", "nutrient_cycling", "wastewater_treatment", "pollution_assessment",
+    "phage_therapy", "phage_biology", "virus_host_interaction", "pathogen_transmission",
+    "classification", "morphology", "interaction_analysis", "dysbiosis_association",
+    "tissue_processing", "extraction", "purification", "plant_biology",
+    "habitat_assessment", "epidemiology", "surveillance", "risk_assessment",
+    "biodiversity", "biogeography", "statistics", "systematic_review",
+    "meta_analysis", "protocol", "method_comparison", "process_optimization",
+    "industrial_application", "bioprocessing", "biofuel_feedstock",
 ]
 
 def get_system_prompt():
-    return f"""You are an expert bioinformatician and biologist data annotator.
-Your task is to classify a given scientific text into EXACTLY ONE Category and EXACTLY ONE primary Domain.
+    cats = ", ".join(f'"{c}"' for c in SUGGESTED_CATEGORIES)
+    return f"""You are an expert bioinformatician and data annotator.
 
-Here are some SUGGESTED Categories: {SUGGESTED_CATEGORIES}
-Here are some SUGGESTED Domains: {SUGGESTED_DOMAINS}
+Classify the scientific text into ONE category.
 
-RULES:
-1. You may choose from the suggested lists, OR INVENT a new short, descriptive Category/Domain if needed.
-2. Output your response STRICTLY as a raw JSON object.
+Try first from this list:
+[{cats}]
 
-EXPECTED JSON FORMAT:
-{{
-    "category": "your_category",
-    "domain": "Your Domain"
-}}"""
+If none fits, invent a new short category name (lowercase_underscore) and provide only the keywords that determined this classification.
 
+Output raw JSON only:
 
-def classify_with_llm(text):
+If exists in list:
+{{"category": "existing_category", "is_new": false}}
+
+If new:
+{{"category": "new_category_name", "is_new": true, "keywords": ["kw1", "kw2", ...]}}"""
+
+def build_text(record):
+    t = record.get('type', '')
+    
+    if t in ('conceptual', 'factual'):
+        q = record.get('question', '') or ''
+        a = record.get('answer', '')   or ''
+        return f"{q} {a}".strip()
+    
+    else:  
+        i = record.get('instruction', '') or ''
+        o = record.get('output', '')      or ''
+        return f"{i} {o}".strip()
+
+def classify_with_llm(idx, record):
+    text = build_text(record)
+    if not text:
+        return idx, None, False, []
     try:
-        truncated_text = text[:5000] if isinstance(text, str) else str(text)
-        
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": get_system_prompt()},
-                {"role": "user", "content": f"Text to classify:\n{truncated_text}"}
+                {"role": "user",   "content": f"TEXT:\n{text[:1500]}"},
             ],
-            temperature=0.3, 
+            temperature=0.2,
         )
-        
-        raw_output = response.choices[0].message.content.strip()
-        match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+        raw   = response.choices[0].message.content.strip()
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
-            parsed_data = json.loads(match.group(0))
-            
-            cat = parsed_data.get('category', 'other')
-            domain = parsed_data.get('domain', 'Other / Unclassified')
-            
-            if isinstance(cat, str): cat = cat.lower().replace(" ", "_")
-            if isinstance(domain, str): domain = domain.title()
-                
-            return cat, domain
-        else:
-            print(f"  [NO-JSON] Réponse LLM brute: {raw_output[:300]}", flush=True)
-            
+            parsed   = json.loads(match.group(0))
+            cat      = parsed.get('category', '').lower().replace(" ", "_")
+            is_new   = parsed.get('is_new', False)
+            keywords = parsed.get('keywords', [])
+            return idx, cat, is_new, keywords
     except Exception as e:
-        print(f"  [ERROR] {type(e).__name__}: {e}", flush=True)
-    return None, None
-    
+        print(f"  [ERROR] idx={idx} {type(e).__name__}: {e}", flush=True)
+    return idx, None, False, []
 
-
-def extract_text_from_row(row):
-    parts = []
-    for key in ['instruction', 'output', 'question', 'answer', 'steps', 'constraints']:
-        if pd.notna(row.get(key)):
-            val = row[key]
-            if isinstance(val, list):
-                parts.append(" ".join(map(str, val)))
-            else:
-                parts.append(str(val))
-    return " ".join(parts)
-
-
-def is_invalid_category(cat):
-    return cat in ('other', 'Other', None, '') or not cat
-
-
-def is_invalid_domain(domains):
-    if not isinstance(domains, list):
-        return True
-    if len(domains) == 0:
-        return True
-    if 'Other / Unclassified' in domains:
-        return True
-    return False
-
+def save_jsonl(rows, filepath):
+    with open(filepath, 'w', encoding='utf-8') as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + '\n')
 
 def main():
-
     if not os.path.exists(INPUT_FILE):
-        print("File introuvable.")
+        print(f"Fichier introuvable : {INPUT_FILE}")
         return
 
     rows = []
     with open(INPUT_FILE, 'r', encoding='utf-8') as f:
         for line in f:
-            line = line.strip()
-            if line:
+            if line.strip():
                 rows.append(json.loads(line))
 
-    
-    target_indices = []
-    for i, row in enumerate(rows):
-        cat = row.get('category', '')
-        domains = row.get('domains', [])
-        if is_invalid_category(cat) or is_invalid_domain(domains):
-            target_indices.append(i)
+    print(f"{len(rows):,} enregistrements  |  workers={MAX_WORKERS}")
 
-    print(f"{len(target_indices)} / {len(rows)} lignes à traiter.")
+    new_categories_found = {}
+    processed = 0
 
-    
-    processed_count = 0
-    try:
-        for idx in tqdm(target_indices):
-            row = rows[idx]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(classify_with_llm, i, row): i for i, row in enumerate(rows)}
 
-           
-            parts = []
-            for key in ['instruction', 'output', 'question', 'answer', 'steps', 'constraints']:
-                val = row.get(key)
-                if val is not None and str(val).strip():
-                    if isinstance(val, list):
-                        parts.append(" ".join(map(str, val)))
+        with tqdm(total=len(rows)) as pbar:
+            for future in as_completed(futures):
+                idx, cat, is_new, keywords = future.result()
+
+                if cat:
+                    rows[idx]['category'] = cat
+                    if is_new:
+                        rows[idx]['category_keywords'] = keywords
+                        new_categories_found[cat] = keywords
+                        print(f"  [NEW]  idx={idx} → {cat}", flush=True)
                     else:
-                        parts.append(str(val))
-            text = " ".join(parts).strip()
+                        print(f"  [OK]   idx={idx} → {cat}", flush=True)
+                else:
+                    print(f"  [FAIL] idx={idx}", flush=True)
 
-            if not text:
-                continue
+                processed += 1
+                pbar.update(1)
 
-            new_cat, new_domain = classify_with_llm(text)
+                if processed % AUTOSAVE_INTERVAL == 0:
+                    save_jsonl(rows, OUTPUT_FILE)
 
-            if new_cat is not None and new_domain is not None:
-                if is_invalid_category(row.get('category', '')):
-                    row['category'] = new_cat
-                if is_invalid_domain(row.get('domains', [])):
-                    row['domains'] = [new_domain]
-                print(f"  [OK] idx={idx} → cat={new_cat}, domain={new_domain}", flush=True)
-            else:
-                print(f"  [FAIL] idx={idx} — LLM n'a rien retourné", flush=True)
+    save_jsonl(rows, OUTPUT_FILE)
+    print(f"\n✅ {OUTPUT_FILE}  —  {processed:,} traités")
 
-            processed_count += 1
-
-          
-            if processed_count % AUTOSAVE_INTERVAL == 0:
-                save_jsonl(rows, OUTPUT_FILE)
-
-    except KeyboardInterrupt:
-        print("\nInterrompu.")
-    finally:
-        save_jsonl(rows, OUTPUT_FILE)
-        print(f"Fichier généré : {OUTPUT_FILE}")
-
-
-def save_jsonl(rows, filepath):
-
-    with open(filepath, 'w', encoding='utf-8') as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + '\n')
-
+    if new_categories_found:
+        print(f"\n{len(new_categories_found)} nouvelles catégories :")
+        for cat, kws in new_categories_found.items():
+            print(f"   {cat:<35} → {kws}")
 
 if __name__ == "__main__":
     main()
