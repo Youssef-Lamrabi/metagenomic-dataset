@@ -1,6 +1,11 @@
 import os
+import sys
 import json
 import re
+import signal
+import atexit
+import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -18,6 +23,28 @@ INPUT_FILE        = "paper_other.jsonl"
 OUTPUT_FILE       = "paper_other_classified.jsonl"
 MAX_WORKERS       = 2
 AUTOSAVE_INTERVAL = 100
+
+_rows_ref           = None
+_output_file_ref    = None
+_shutdown_requested = False
+
+def _emergency_save():
+    if _rows_ref is not None and _output_file_ref is not None:
+        try:
+            save_jsonl(_rows_ref, _output_file_ref)
+            done = sum(1 for r in _rows_ref if r.get('category', 'other') not in ('other', '', None))
+            print(f"\nSauvegarde : {done}/{len(_rows_ref)} classifiés → {_output_file_ref}", flush=True)
+        except Exception as e:
+            print(f"\nÉchec sauvegarde : {e}", flush=True)
+
+def _signal_handler(signum, frame):
+    global _shutdown_requested
+    _shutdown_requested = True
+    sys.exit(0)
+
+signal.signal(signal.SIGINT,  _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+atexit.register(_emergency_save)
 
 SUGGESTED_CATEGORIES = {
     "pipeline_design": [
@@ -197,28 +224,18 @@ SUGGESTED_CATEGORIES = {
     ],
 }
 
-
-def get_system_prompt():
-    cats_str = "\n".join(
-        f'  "{k}": {json.dumps(v[:9])}'   
-        for k, v in SUGGESTED_CATEGORIES.items()
-    )
-    return f"""You are an expert bioinformatician and data annotator.
-
-Classify the scientific text into ONE category using the list below.
-Each category is shown with sample keywords to help you decide.
-
-{cats_str}
-
-If none fits, invent a new short category name (lowercase_underscore) and provide only the keywords that determined this classification.
-
-Output raw JSON only, no explanation:
-
-If exists in list:
-{{"category": "existing_category", "is_new": false}}
-
-If new:
-{{"category": "new_category_name", "is_new": true, "keywords": ["kw1", "kw2", ...]}}"""
+# ── calculé une seule fois au démarrage ───────────────────────────────────────
+SYSTEM_PROMPT = (
+    "You are an expert bioinformatician and data annotator.\n\n"
+    "Classify the scientific text into ONE category using the list below.\n"
+    "Each category is shown with sample keywords to help you decide.\n\n"
+    + "\n".join(f'  "{k}": {json.dumps(v[:9])}' for k, v in SUGGESTED_CATEGORIES.items())
+    + "\n\nIf none fits, invent a new short category name (lowercase_underscore) "
+    "and provide only the keywords that determined this classification.\n\n"
+    "Output raw JSON only, no explanation:\n\n"
+    'If exists in list:\n{"category": "existing_category", "is_new": false}\n\n'
+    'If new:\n{"category": "new_category_name", "is_new": true, "keywords": ["kw1", "kw2", ...]}'
+)
 
 
 def build_text(record):
@@ -241,7 +258,7 @@ def classify_with_llm(idx, record):
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": get_system_prompt()},
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": f"TEXT:\n{text[:1500]}"},
             ],
             temperature=0.2,
@@ -265,10 +282,45 @@ def save_jsonl(rows, filepath):
             f.write(json.dumps(row, ensure_ascii=False) + '\n')
 
 
+def verify_workers(n_workers):
+    print(f"\n--- Verification parallelisation ({n_workers} workers) ---")
+    active_threads = []
+    lock = threading.Lock()
+    max_concurrent = [0]
+
+    def _worker_task(wid):
+        with lock:
+            active_threads.append(wid)
+            if len(active_threads) > max_concurrent[0]:
+                max_concurrent[0] = len(active_threads)
+        time.sleep(0.5)
+        with lock:
+            active_threads.remove(wid)
+        return wid
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futs = {ex.submit(_worker_task, i): i for i in range(n_workers)}
+        results = [f.result() for f in as_completed(futs)]
+    elapsed = time.time() - t0
+
+    parallel = max_concurrent[0] >= min(n_workers, 2)
+    seq_time = 0.5 * n_workers
+
+    if parallel and elapsed < seq_time * 0.8:
+        print(f"  [PASS] {max_concurrent[0]} workers simultanes | {elapsed:.2f}s (seq aurait pris ~{seq_time:.1f}s)")
+    else:
+        print(f"  [WARN] max concurrent={max_concurrent[0]} | {elapsed:.2f}s — parallelisation limitee")
+    print()
+    return parallel
+
+
 def main():
     if not os.path.exists(INPUT_FILE):
         print(f"Fichier introuvable : {INPUT_FILE}")
         return
+
+    verify_workers(MAX_WORKERS)
 
     if os.path.exists(OUTPUT_FILE):
         rows = []
@@ -276,7 +328,7 @@ def main():
             for line in f:
                 if line.strip():
                     rows.append(json.loads(line))
-        already_done = {i for i, r in enumerate(rows) if r.get('category', 'other') != 'other'}
+        already_done = {i for i, r in enumerate(rows) if r.get('category', 'other') not in ('other', '', None)}
         print(f"Reprise : {len(already_done)}/{len(rows)} déjà classifiés")
     else:
         rows = []
@@ -296,32 +348,49 @@ def main():
     new_categories_found = {}
     processed = 0
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(classify_with_llm, i, row): i for i, row in to_process}
+    global _rows_ref, _output_file_ref
+    _rows_ref = rows
+    _output_file_ref = OUTPUT_FILE
 
-        with tqdm(total=len(to_process)) as pbar:
-            for future in as_completed(futures):
-                idx, cat, is_new, keywords = future.result()
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(classify_with_llm, i, row): i for i, row in to_process}
 
-                if cat:
-                    rows[idx]['category'] = cat
-                    if is_new:
-                        rows[idx]['category_keywords'] = keywords
-                        new_categories_found[cat] = keywords
-                        print(f"  [NEW]  idx={idx} → {cat}", flush=True)
+            with tqdm(total=len(to_process)) as pbar:
+                for future in as_completed(futures):
+                    if _shutdown_requested:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+
+                    idx, cat, is_new, keywords = future.result()
+
+                    if cat:
+                        rows[idx]['category'] = cat
+                        if is_new:
+                            rows[idx]['category_keywords'] = keywords
+                            new_categories_found[cat] = keywords
+                            print(f"  [NEW]  idx={idx} → {cat}", flush=True)
+                        else:
+                            print(f"  [OK]   idx={idx} → {cat}", flush=True)
                     else:
-                        print(f"  [OK]   idx={idx} → {cat}", flush=True)
-                else:
-                    print(f"  [FAIL] idx={idx}", flush=True)
+                        print(f"  [FAIL] idx={idx}", flush=True)
 
-                processed += 1
-                pbar.update(1)
+                    processed += 1
+                    pbar.update(1)
 
-                if processed % AUTOSAVE_INTERVAL == 0:
-                    save_jsonl(rows, OUTPUT_FILE)
+                    if processed % AUTOSAVE_INTERVAL == 0:
+                        save_jsonl(rows, OUTPUT_FILE)
+                        print(f"  [SAVE] autosave @ {processed}", flush=True)
 
-    save_jsonl(rows, OUTPUT_FILE)
-    print(f"\n {OUTPUT_FILE}  —  {processed:,} traités")
+    except (KeyboardInterrupt, SystemExit):
+        print(f"\nInterruption détectée après {processed} traités", flush=True)
+    except Exception as e:
+        print(f"\nErreur inattendue : {type(e).__name__}: {e}", flush=True)
+    finally:
+        save_jsonl(rows, OUTPUT_FILE)
+        done = sum(1 for r in rows if r.get('category', 'other') not in ('other', '', None))
+        print(f"\nSauvegarde finale : {done}/{len(rows)} classifiés → {OUTPUT_FILE}", flush=True)
+        _rows_ref = None
 
     if new_categories_found:
         print(f"\n{len(new_categories_found)} nouvelles catégories :")
