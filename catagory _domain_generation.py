@@ -8,12 +8,15 @@ from openai import OpenAI
 
 load_dotenv()
 
-client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-MODEL_NAME = "gpt-oss:20b"
+API_BASE   = os.getenv("LLM_API_BASE", "http://localhost:11434/v1")
+API_KEY    = os.getenv("LLM_API_KEY", "ollama")
+MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-oss:20b")
+
+client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=120)
 
 INPUT_FILE  = "paper_other.jsonl"
 OUTPUT_FILE = "paper_other_classified.jsonl"
-MAX_WORKERS = 3
+MAX_WORKERS = 2
 AUTOSAVE_INTERVAL = 100
 
 SUGGESTED_CATEGORIES = [
@@ -108,21 +111,37 @@ def main():
         print(f"Fichier introuvable : {INPUT_FILE}")
         return
 
-    rows = []
-    with open(INPUT_FILE, 'r', encoding='utf-8') as f:
-        for line in f:
-            if line.strip():
-                rows.append(json.loads(line))
+    # --- Resume : charger la sortie existante ou le fichier d'entrée ---
+    if os.path.exists(OUTPUT_FILE):
+        rows = []
+        with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+        already_done = {i for i, r in enumerate(rows) if 'category' in r}
+        print(f"Reprise détectée : {len(already_done)}/{len(rows)} déjà classifiés")
+    else:
+        rows = []
+        with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+        already_done = set()
 
-    print(f"{len(rows):,} enregistrements  |  workers={MAX_WORKERS}")
+    to_process = [(i, row) for i, row in enumerate(rows) if i not in already_done]
+    print(f"{len(rows):,} total  |  {len(to_process):,} à traiter  |  workers={MAX_WORKERS}")
+
+    if not to_process:
+        print("Tout est déjà classifié !")
+        return
 
     new_categories_found = {}
     processed = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(classify_with_llm, i, row): i for i, row in enumerate(rows)}
+        futures = {executor.submit(classify_with_llm, i, row): i for i, row in to_process}
 
-        with tqdm(total=len(rows)) as pbar:
+        with tqdm(total=len(to_process)) as pbar:
             for future in as_completed(futures):
                 idx, cat, is_new, keywords = future.result()
 
