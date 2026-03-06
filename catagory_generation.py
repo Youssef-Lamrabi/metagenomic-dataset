@@ -21,30 +21,39 @@ client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=120)
 
 INPUT_FILE        = "paper_other.jsonl"
 OUTPUT_FILE       = "paper_other_classified.jsonl"
-MAX_WORKERS       = 2
+MAX_WORKERS       = 4  
 AUTOSAVE_INTERVAL = 100
 
 _rows_ref           = None
 _output_file_ref    = None
 _shutdown_requested = False
 
+
+_active_workers  = 0
+_worker_lock     = threading.Lock()
+_max_seen        = 0
+
+
 def _emergency_save():
     if _rows_ref is not None and _output_file_ref is not None:
         try:
             save_jsonl(_rows_ref, _output_file_ref)
             done = sum(1 for r in _rows_ref if r.get('category', 'other') not in ('other', '', None))
-            print(f"\nSauvegarde : {done}/{len(_rows_ref)} classifiés → {_output_file_ref}", flush=True)
+            print(f"\nSauvegarde urgence : {done}/{len(_rows_ref)} classifiés → {_output_file_ref}", flush=True)
         except Exception as e:
             print(f"\nÉchec sauvegarde : {e}", flush=True)
 
+
 def _signal_handler(signum, frame):
     global _shutdown_requested
+    print(f"\nSignal reçu — sauvegarde en cours...", flush=True)
     _shutdown_requested = True
-    sys.exit(0)
+    _emergency_save()
+    os._exit(0)
+
 
 signal.signal(signal.SIGINT,  _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
-atexit.register(_emergency_save)
 
 SUGGESTED_CATEGORIES = {
     "pipeline_design": [
@@ -224,12 +233,11 @@ SUGGESTED_CATEGORIES = {
     ],
 }
 
-# ── calculé une seule fois au démarrage ───────────────────────────────────────
 SYSTEM_PROMPT = (
     "You are an expert bioinformatician and data annotator.\n\n"
     "Classify the scientific text into ONE category using the list below.\n"
     "Each category is shown with sample keywords to help you decide.\n\n"
-    + "\n".join(f'  "{k}": {json.dumps(v[:9])}' for k, v in SUGGESTED_CATEGORIES.items())
+    + "\n".join(f'  "{k}": {json.dumps(v[:11])}' for k, v in SUGGESTED_CATEGORIES.items())
     + "\n\nIf none fits, invent a new short category name (lowercase_underscore) "
     "and provide only the keywords that determined this classification.\n\n"
     "Output raw JSON only, no explanation:\n\n"
@@ -251,9 +259,20 @@ def build_text(record):
 
 
 def classify_with_llm(idx, record):
+    global _active_workers, _max_seen
+
+    with _worker_lock:
+        _active_workers += 1
+        if _active_workers > _max_seen:
+            _max_seen = _active_workers
+        print(f"  [START] idx={idx:>5}  | actifs={_active_workers}/{MAX_WORKERS}  t={time.strftime('%H:%M:%S')}", flush=True)
+
     text = build_text(record)
     if not text:
+        with _worker_lock:
+            _active_workers -= 1
         return idx, None, False, []
+
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
@@ -270,9 +289,16 @@ def classify_with_llm(idx, record):
             cat      = parsed.get('category', '').lower().replace(" ", "_")
             is_new   = parsed.get('is_new', False)
             keywords = parsed.get('keywords', [])
+            with _worker_lock:
+                _active_workers -= 1
+                print(f"  [END]   idx={idx:>5}  | actifs={_active_workers}/{MAX_WORKERS}  t={time.strftime('%H:%M:%S')}  → {cat}", flush=True)
             return idx, cat, is_new, keywords
+
     except Exception as e:
         print(f"  [ERROR] idx={idx} {type(e).__name__}: {e}", flush=True)
+
+    with _worker_lock:
+        _active_workers -= 1
     return idx, None, False, []
 
 
@@ -282,45 +308,30 @@ def save_jsonl(rows, filepath):
             f.write(json.dumps(row, ensure_ascii=False) + '\n')
 
 
-def verify_workers(n_workers):
-    print(f"\n--- Verification parallelisation ({n_workers} workers) ---")
-    active_threads = []
-    lock = threading.Lock()
-    max_concurrent = [0]
-
-    def _worker_task(wid):
-        with lock:
-            active_threads.append(wid)
-            if len(active_threads) > max_concurrent[0]:
-                max_concurrent[0] = len(active_threads)
-        time.sleep(0.5)
-        with lock:
-            active_threads.remove(wid)
-        return wid
-
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=n_workers) as ex:
-        futs = {ex.submit(_worker_task, i): i for i in range(n_workers)}
-        results = [f.result() for f in as_completed(futs)]
-    elapsed = time.time() - t0
-
-    parallel = max_concurrent[0] >= min(n_workers, 2)
-    seq_time = 0.5 * n_workers
-
-    if parallel and elapsed < seq_time * 0.8:
-        print(f"  [PASS] {max_concurrent[0]} workers simultanes | {elapsed:.2f}s (seq aurait pris ~{seq_time:.1f}s)")
+def check_ollama_parallel():
+    """Vérifie si OLLAMA_NUM_PARALLEL est bien configuré."""
+    print("\n--- Vérification configuration Ollama ---")
+    num_parallel = os.getenv("OLLAMA_NUM_PARALLEL")
+    if num_parallel:
+        print(f"  OLLAMA_NUM_PARALLEL = {num_parallel}")
+        if int(num_parallel) < MAX_WORKERS:
+            print(f"  [WARN] OLLAMA_NUM_PARALLEL={num_parallel} < MAX_WORKERS={MAX_WORKERS} → augmenter OLLAMA_NUM_PARALLEL")
+        else:
+            print(f"  [OK] Ollama configuré pour {num_parallel} requêtes simultanées")
     else:
-        print(f"  [WARN] max concurrent={max_concurrent[0]} | {elapsed:.2f}s — parallelisation limitee")
+        print(f"  [WARN] OLLAMA_NUM_PARALLEL non défini → Ollama traitera 1 requête à la fois")
+        print(f"         Fix : relancer Ollama avec : OLLAMA_NUM_PARALLEL={MAX_WORKERS} ollama serve")
     print()
-    return parallel
 
 
 def main():
+    global _rows_ref, _output_file_ref
+
     if not os.path.exists(INPUT_FILE):
         print(f"Fichier introuvable : {INPUT_FILE}")
         return
 
-    verify_workers(MAX_WORKERS)
+    check_ollama_parallel()
 
     if os.path.exists(OUTPUT_FILE):
         rows = []
@@ -339,18 +350,18 @@ def main():
         already_done = set()
 
     to_process = [(i, row) for i, row in enumerate(rows) if i not in already_done]
-    print(f"{len(rows):,} total  |  {len(to_process):,} à traiter  |  workers={MAX_WORKERS}")
+    print(f"{len(rows):,} total  |  {len(to_process):,} à traiter  |  MAX_WORKERS={MAX_WORKERS}")
 
     if not to_process:
         print("Tout est déjà classifié !")
         return
 
+    _rows_ref        = rows
+    _output_file_ref = OUTPUT_FILE
+
     new_categories_found = {}
     processed = 0
-
-    global _rows_ref, _output_file_ref
-    _rows_ref = rows
-    _output_file_ref = OUTPUT_FILE
+    t_start   = time.time()
 
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -369,9 +380,8 @@ def main():
                         if is_new:
                             rows[idx]['category_keywords'] = keywords
                             new_categories_found[cat] = keywords
-                            print(f"  [NEW]  idx={idx} → {cat}", flush=True)
                         else:
-                            print(f"  [OK]   idx={idx} → {cat}", flush=True)
+                            pass
                     else:
                         print(f"  [FAIL] idx={idx}", flush=True)
 
@@ -380,16 +390,20 @@ def main():
 
                     if processed % AUTOSAVE_INTERVAL == 0:
                         save_jsonl(rows, OUTPUT_FILE)
-                        print(f"  [SAVE] autosave @ {processed}", flush=True)
+                        elapsed = time.time() - t_start
+                        rate    = processed / elapsed * 60
+                        print(f"  [SAVE] {processed} traités | {rate:.1f} rows/min | max_parallel_vu={_max_seen}", flush=True)
 
     except (KeyboardInterrupt, SystemExit):
-        print(f"\nInterruption détectée après {processed} traités", flush=True)
+        print(f"\nInterruption après {processed} traités", flush=True)
     except Exception as e:
-        print(f"\nErreur inattendue : {type(e).__name__}: {e}", flush=True)
+        print(f"\nErreur : {type(e).__name__}: {e}", flush=True)
     finally:
         save_jsonl(rows, OUTPUT_FILE)
-        done = sum(1 for r in rows if r.get('category', 'other') not in ('other', '', None))
+        done    = sum(1 for r in rows if r.get('category', 'other') not in ('other', '', None))
+        elapsed = time.time() - t_start
         print(f"\nSauvegarde finale : {done}/{len(rows)} classifiés → {OUTPUT_FILE}", flush=True)
+        print(f"   Temps total : {elapsed:.1f}s  |  max workers simultanés observés : {_max_seen}/{MAX_WORKERS}", flush=True)
         _rows_ref = None
 
     if new_categories_found:
